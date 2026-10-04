@@ -13,9 +13,10 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import uuid4
 
 from navigator.browser import FrameStore
-from navigator.runner import EventBus, Runtime, run_aop
+from navigator.runner import EventBus, Runtime, exception_status, run_aop
 
 ROOT = Path(__file__).parent
 CONFIG = json.loads((ROOT / "config.json").read_text())
@@ -42,14 +43,24 @@ def start_run(overrides: dict) -> bool:
         raise RuntimeError("Set OPENROUTER_API_KEY")
 
     def worker():
+        rt = None
+        run_id = uuid4().hex
         try:
             BUS.reset()
+            BUS.configure_trace(CONFIG.get("tracing", {}), run_id, (key,))
             aop = json.loads(AOP_PATH.read_text())
             cfg = {**aop.get("global_config", {}), **CONFIG}
-            rt = Runtime(cfg, {"openrouter": key}, BUS, FRAMES)
+            rt = Runtime(cfg, {"openrouter": key}, BUS, FRAMES, run_id=run_id)
             asyncio.run(run_aop(aop, overrides, rt))
-        except Exception as e:  # surface setup failures in the UI
-            BUS.emit("run_finished", {"status": "error", "reason": f"{type(e).__name__}: {e}"})
+        except BaseException as e:  # report catchable interruptions, then propagate them
+            if rt is None:
+                BUS.emit("run_finished", {"schema_version": 1, "run_id": run_id, "status": exception_status(e),
+                                          "error_type": type(e).__name__, "reason": f"{type(e).__name__}: {e}"})
+            elif not rt.finished:
+                rt.finish_run({"status": exception_status(e), "error_type": type(e).__name__,
+                                         "reason": f"{type(e).__name__}: {e}"})
+            if not isinstance(e, Exception):
+                raise
         finally:
             RUN_LOCK.release()
 

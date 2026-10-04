@@ -3,6 +3,7 @@ import time
 
 from . import checks, escalate, jev, policy
 from .browser import StaleTarget, digits
+from .tracing import observation_summary
 
 
 class Metrics:
@@ -110,6 +111,7 @@ async def finish_if_accepted(node, b, rt, m, esc_model, step, poll: bool) -> dic
 
 async def run_ui_task(node: dict, variables: dict, rt) -> dict:
     """rt: runtime with .browser, .emit(type, data), .keys, .cfg, .metrics"""
+    rt.ensure_task_context(node)
     b, m, cfg = rt.browser, rt.metrics, {**policy.DEFAULTS, **rt.cfg.get("policy", {})}
     goal = node["goal"]
     rules = node.get("rules", [])
@@ -124,136 +126,162 @@ async def run_ui_task(node: dict, variables: dict, rt) -> dict:
     if node.get("start_url") and b.page.url.rstrip("/") != node["start_url"].rstrip("/"):
         await b.page.goto(node["start_url"], wait_until="domcontentloaded")
     obs = await b.settle()
-    rt.emit("observation", {"obs": obs})
+    rt.emit("observation", {"obs": obs, "phase": "initial"})
 
     for step in range(1, cfg["max_steps"] + 1):
-        cooldown = {k: n - 1 for k, n in cooldown.items() if n > 1}
-        elements = [({**e, "operations": [], "note": "click had no visible effect; not offered this step"}
-                     if (e["role"], e["label"], e.get("section", "")) in cooldown else e) for e in obs["elements"]]
-        obs_for_jev = {**obs, "elements": elements + extra_rows}
-        eff_goal = goal + (f"\nCurrent subgoal: {subgoal}" if subgoal else "")
-        t = time.perf_counter()
-        try:
-            d = await jev.decide(obs_for_jev, eff_goal, rules, inputs, history, prev, rt.keys["openrouter"])
-        except (jev.JevError, KeyError, ValueError) as e:
-            m.buckets["decide"] += time.perf_counter() - t
-            rt.emit("error", {"step": step, "message": str(e)})
-            return {"status": "BLOCKED", "reason": str(e), "outputs": {}}
-        m.buckets["decide"] += time.perf_counter() - t
-        m.jev_requests += 1
-        m.latencies.append(d["latency_ms"])
-        m.input_tokens += d["input_tokens"]
-        m.tokens_measured &= d["tokens_measured"]
-
-        d["prev_ok"] = prev.get("ok") if prev else None
-        verdict = policy.judge(d, node, obs_for_jev, cfg, escalations_used)
-        rt.emit("jev_request", {"step": step, "request": d["request"], "raw_answers": d["raw"].get("answers", d["raw"])})
-        rt.emit("decision", {"step": step, "model": d["raw"].get("model"), "operation": d["operation"], "target": d["target"], "value": d["value"],
-                             "flags": d["flags"], "verifying": prev and prev["describe"], "latency_ms": d["latency_ms"],
-                             "input_tokens": d["input_tokens"], "verdict": verdict, "metrics": m.snapshot()})
-
-        if verdict["verdict"] in ("HANDOFF", "BLOCKED"):
-            return {"status": verdict["verdict"], "reason": verdict["reason"], "outputs": {}}
-
-        if verdict["verdict"] == "ESCALATE":
-            escalations_used += 1
-            m.escalations += 1
+        with rt.step_scope(step):
+            cooldown = {k: n - 1 for k, n in cooldown.items() if n > 1}
+            elements = [({**e, "operations": [], "note": "click had no visible effect; not offered this step"}
+                         if (e["role"], e["label"], e.get("section", "")) in cooldown else e) for e in obs["elements"]]
+            obs_for_jev = {**obs, "elements": elements + extra_rows}
+            eff_goal = goal + (f"\nCurrent subgoal: {subgoal}" if subgoal else "")
+            rt.trace_event("step_context", {"effective_goal": eff_goal, "subgoal": subgoal,
+                                           "observation_summary": observation_summary(obs_for_jev)})
             t = time.perf_counter()
             try:
-                region = await b.active_region_html()
-                out, meta = await escalate.direction(esc_model, rt.keys["openrouter"], eff_goal, rules, obs_for_jev,
-                                                     history, verdict["reason"], region)
-            except Exception as e:  # escalation failure never causes an action
+                d = await jev.decide(obs_for_jev, eff_goal, rules, inputs, history, prev, rt.keys["openrouter"])
+            except (jev.JevError, KeyError, ValueError) as e:
+                m.buckets["decide"] += time.perf_counter() - t
+                rt.emit("error", {"step": step, "message": str(e), "error_type": type(e).__name__, "stage": "decide"})
+                return rt.task_result({"status": "BLOCKED", "reason": str(e), "outputs": {}})
+            m.buckets["decide"] += time.perf_counter() - t
+            m.jev_requests += 1
+            m.latencies.append(d["latency_ms"])
+            m.input_tokens += d["input_tokens"]
+            m.tokens_measured &= d["tokens_measured"]
+
+            d["prev_ok"] = prev.get("ok") if prev else None
+            verdict = policy.judge(d, node, obs_for_jev, cfg, escalations_used)
+            rt.emit("jev_request", {"step": step, "request": d["request"], "raw_answers": d["raw"].get("answers", d["raw"])})
+            rt.emit("decision", {"step": step, "model": d["raw"].get("model"), "operation": d["operation"], "target": d["target"], "value": d["value"],
+                                 "selected_target": next((e for e in obs_for_jev["elements"] if d["target"] and e["index"] == d["target"]["value"].split(":")[0]), None),
+                                 "verifies_step_id": rt.previous_action_step_id if prev else None,
+                                 "flags": d["flags"], "verifying": prev and prev["describe"], "latency_ms": d["latency_ms"],
+                                 "input_tokens": d["input_tokens"], "verdict": verdict, "metrics": m.snapshot()})
+
+            if verdict["verdict"] in ("HANDOFF", "BLOCKED"):
+                return rt.task_result({"status": verdict["verdict"], "reason": verdict["reason"], "outputs": {}})
+
+            if verdict["verdict"] == "ESCALATE":
+                escalations_used += 1
+                m.escalations += 1
+                t = time.perf_counter()
+                try:
+                    region = await b.active_region_html()
+                    out, meta = await escalate.direction(esc_model, rt.keys["openrouter"], eff_goal, rules, obs_for_jev,
+                                                         history, verdict["reason"], region)
+                except Exception as e:  # escalation failure never causes an action
+                    m.buckets["escalate"] += time.perf_counter() - t
+                    rt.emit("escalation", {"step": step, "error": str(e), "error_type": type(e).__name__, "stage": "escalate"})
+                    return rt.task_result({"status": "HANDOFF", "reason": f"escalation failed: {e}", "outputs": {}})
                 m.buckets["escalate"] += time.perf_counter() - t
-                rt.emit("escalation", {"step": step, "error": str(e)})
-                return {"status": "HANDOFF", "reason": f"escalation failed: {e}", "outputs": {}}
-            m.buckets["escalate"] += time.perf_counter() - t
-            m.esc_tokens += int((meta.get("usage") or {}).get("total_tokens") or 0)
-            adopted = []
-            for c in out.get("candidates", []):
-                row = await b.adopt_locator(c["locator"])
-                if row:
-                    adopted.append(row)
-            extra_rows = adopted
-            subgoal = out.get("subgoal") or subgoal
-            rt.emit("escalation", {"step": step, "reason": verdict["reason"], "diagnosis": out.get("diagnosis"),
-                                   "subgoal": subgoal, "proposed": [c["locator"] for c in out.get("candidates", [])],
-                                   "adopted": [r["locator"] for r in adopted], "latency_ms": meta["latency_ms"],
-                                   "metrics": m.snapshot()})
-            if out.get("handoff"):
-                return {"status": "HANDOFF", "reason": out.get("diagnosis") or "escalation requested handoff", "outputs": {}}
-            key = (out.get("subgoal"), tuple(r["locator"] for r in adopted))
-            if key == last_escalation and not adopted:
-                return {"status": "HANDOFF", "reason": "escalation repeated the same direction with no new candidates", "outputs": {}}
-            last_escalation = key
-            prev = None
-            continue
-
-        if verdict["verdict"] == "DONE_CHECK":
-            result = await finish_if_accepted(node, b, rt, m, esc_model, step, poll=True)
-            if result:
-                return result
-            done_rejections += 1
-            if done_rejections >= 2:
-                return {"status": "HANDOFF", "reason": "DONE claimed twice but acceptance failed", "outputs": {}}
-            history.append({"action": "DONE rejected by acceptance checks", "page_changed": False})
-            prev = None
-            continue
-
-        # ---- ACT ----
-        op = d["operation"]["value"]
-        target = d["target"]["value"] if d["target"] else None
-        value_name = d["value"]["value"] if d["value"] else None
-        text = str(inputs[value_name]) if value_name else None
-        desc = describe(op, target, obs_for_jev, value_name, text)
-        tgt_el = next((e for e in obs_for_jev["elements"] if target and e["index"] == target.split(":")[0]), None)
-        if policy.irreversible(node, tgt_el):  # code-checkable rules run before any Submit-like click
-            for g in node.get("guards", {}).get("before_irreversible", []):
-                ok_g, detail_g = await checks.run_check(b.page, b.observe, g)
-                rt.emit("acceptance", {"step": step, "results": [{"check": "guard " + g["check"], "ok": ok_g, "detail": detail_g}]})
-                if not ok_g:
-                    return {"status": "HANDOFF", "reason": f"guard failed before irreversible action: {detail_g}", "outputs": {}}
-        attempts = 2 if policy.RETRY_SAFE.get(op) else 1
-        t = time.perf_counter()
-        ok, detail, after, stale = False, "", obs, False
-        for attempt in range(attempts):
-            try:
-                res = await b.act(op, target, obs_for_jev, text)
-                after = res["after"]
-            except StaleTarget as e:
-                ok, detail, after, stale = False, str(e), await b.settle(), True
-                break
-            except Exception as e:
-                ok, detail, after = False, f"{type(e).__name__}: {str(e)[:160]}", await b.settle()
-                if not policy.RETRY_SAFE.get(op):
-                    break
+                m.esc_tokens += int((meta.get("usage") or {}).get("total_tokens") or 0)
+                adopted = []
+                for c in out.get("candidates", []):
+                    row = await b.adopt_locator(c["locator"])
+                    if row:
+                        adopted.append(row)
+                extra_rows = adopted
+                subgoal = out.get("subgoal") or subgoal
+                rt.emit("escalation", {"step": step, "reason": verdict["reason"], "diagnosis": out.get("diagnosis"),
+                                       "subgoal": subgoal, "proposed": [c["locator"] for c in out.get("candidates", [])],
+                                       "adopted": [r["locator"] for r in adopted], "latency_ms": meta["latency_ms"],
+                                       "metrics": m.snapshot()})
+                if out.get("handoff"):
+                    return rt.task_result({"status": "HANDOFF", "reason": out.get("diagnosis") or "escalation requested handoff", "outputs": {}})
+                key = (out.get("subgoal"), tuple(r["locator"] for r in adopted))
+                if key == last_escalation and not adopted:
+                    return rt.task_result({"status": "HANDOFF", "reason": "escalation repeated the same direction with no new candidates", "outputs": {}})
+                last_escalation = key
+                prev = None
                 continue
-            ok, detail = readback(op, target, obs_for_jev, after, text)
-            if ok:
-                break
-        spent = time.perf_counter() - t
-        m.buckets["wait" if op == "WAIT" else "act"] += spent
-        m.steps += 1
-        m.verified += int(ok)
-        extra_rows = []
-        changed = after["fingerprint"] != obs["fingerprint"]
-        history.append({"step": step, "action": desc, "readback": detail, "page_changed": changed})
-        if op == "CLICK" and not ok and tgt_el:
-            cooldown[(tgt_el["role"], tgt_el["label"], tgt_el.get("section", ""))] = 3  # this step + next two
-        rt.emit("action", {"step": step, "describe": desc, "ok": ok, "readback": detail, "retry_safe": policy.RETRY_SAFE.get(op),
-                           "ms": round(spent * 1000), "metrics": m.snapshot()})
-        rt.emit("observation", {"obs": after})
-        if stale:  # page re-rendered between decision and action: not a failure, decide again
-            prev, obs = None, after
-            continue
-        if not ok and op != "CLICK":  # safe ops were already retried once
-            return {"status": "HANDOFF", "reason": f"readback failed: {detail}", "outputs": {}}
-        recent = history[-cfg["no_progress_steps"]:]
-        if len(recent) == cfg["no_progress_steps"] and all(not h.get("page_changed") and "WAIT" not in h.get("action", "") for h in recent):
-            return {"status": "BLOCKED", "reason": "no progress for 3 steps", "outputs": {}}
-        prev = {"describe": desc, "readback": detail, "ok": ok, "url_before": obs["url"], "url_after": after["url"]}
-        obs = after
-        result = await finish_if_accepted(node, b, rt, m, esc_model, step, poll=False)  # D28
-        if result:
-            return result
+
+            if verdict["verdict"] == "DONE_CHECK":
+                result = await finish_if_accepted(node, b, rt, m, esc_model, step, poll=True)
+                if result:
+                    return rt.task_result(result)
+                done_rejections += 1
+                if done_rejections >= 2:
+                    return rt.task_result({"status": "HANDOFF", "reason": "DONE claimed twice but acceptance failed", "outputs": {}})
+                history.append({"action": "DONE rejected by acceptance checks", "page_changed": False})
+                prev = None
+                continue
+
+            # ---- ACT ----
+            op = d["operation"]["value"]
+            target = d["target"]["value"] if d["target"] else None
+            value_name = d["value"]["value"] if d["value"] else None
+            text = str(inputs[value_name]) if value_name else None
+            desc = describe(op, target, obs_for_jev, value_name, text)
+            tgt_el = next((e for e in obs_for_jev["elements"] if target and e["index"] == target.split(":")[0]), None)
+            selected = dict(tgt_el) if tgt_el else None
+            if selected is not None and op == "SELECT":
+                selected["selected_option"] = next((o for o in selected.get("options", []) if o["index"] == target), None)
+            rt.trace_event("action_selected", {"operation": d["operation"], "selected_target": selected,
+                                               "input_name": value_name, "input_text": text, "url_before": obs["url"]})
+            if policy.irreversible(node, tgt_el):  # code-checkable rules run before any Submit-like click
+                for g in node.get("guards", {}).get("before_irreversible", []):
+                    ok_g, detail_g = await checks.run_check(b.page, b.observe, g)
+                    rt.emit("acceptance", {"step": step, "results": [{"check": "guard " + g["check"], "ok": ok_g, "detail": detail_g}]})
+                    if not ok_g:
+                        return rt.task_result({"status": "HANDOFF", "reason": f"guard failed before irreversible action: {detail_g}", "outputs": {}})
+            attempts = 2 if policy.RETRY_SAFE.get(op) else 1
+            t = time.perf_counter()
+            ok, detail, after, stale = False, "", obs, False
+            for attempt in range(attempts):
+                attempt_start = time.perf_counter()
+                rt.trace_event("action_attempt_started", {"attempt": attempt + 1, "retry_count": attempt,
+                                                           "url_before": obs["url"]})
+                try:
+                    res = await b.act(op, target, obs_for_jev, text)
+                    after = res["after"]
+                except StaleTarget as e:
+                    rt.trace_event("action_attempt_error", {"attempt": attempt + 1, "execution_status": "stale",
+                                                            "stage": "act", "error_type": type(e).__name__, "message": str(e)})
+                    ok, detail, after, stale = False, str(e), await b.settle(), True
+                    rt.trace_event("action_attempt_finished", {"attempt": attempt + 1, "execution_status": "stale",
+                                                               "ok": ok, "url_after": after["url"], "ms": round((time.perf_counter() - attempt_start) * 1000)})
+                    break
+                except Exception as e:
+                    rt.trace_event("action_attempt_error", {"attempt": attempt + 1, "execution_status": "error",
+                                                            "stage": "act", "error_type": type(e).__name__, "message": str(e)})
+                    ok, detail, after = False, f"{type(e).__name__}: {str(e)[:160]}", await b.settle()
+                    rt.trace_event("action_attempt_finished", {"attempt": attempt + 1, "execution_status": "error",
+                                                               "ok": ok, "url_after": after["url"], "ms": round((time.perf_counter() - attempt_start) * 1000)})
+                    if not policy.RETRY_SAFE.get(op):
+                        break
+                    continue
+                ok, detail = readback(op, target, obs_for_jev, after, text)
+                rt.trace_event("action_attempt_finished", {"attempt": attempt + 1, "execution_status": "returned",
+                                                           "ok": ok, "readback": detail, "url_after": after["url"],
+                                                           "page_changed": after["fingerprint"] != obs["fingerprint"],
+                                                           "ms": round((time.perf_counter() - attempt_start) * 1000)})
+                if ok:
+                    break
+            spent = time.perf_counter() - t
+            m.buckets["wait" if op == "WAIT" else "act"] += spent
+            m.steps += 1
+            m.verified += int(ok)
+            extra_rows = []
+            changed = after["fingerprint"] != obs["fingerprint"]
+            history.append({"step": step, "action": desc, "readback": detail, "page_changed": changed})
+            if op == "CLICK" and not ok and tgt_el:
+                cooldown[(tgt_el["role"], tgt_el["label"], tgt_el.get("section", ""))] = 3  # this step + next two
+            rt.emit("action", {"step": step, "describe": desc, "ok": ok, "readback": detail, "retry_safe": policy.RETRY_SAFE.get(op),
+                               "retry_count": attempt, "url_before": obs["url"], "url_after": after["url"], "page_changed": changed,
+                               "ms": round(spent * 1000), "metrics": m.snapshot()})
+            rt.emit("observation", {"obs": after, "phase": "after_action"})
+            if stale:  # page re-rendered between decision and action: not a failure, decide again
+                prev, obs = None, after
+                continue
+            if not ok and op != "CLICK":  # safe ops were already retried once
+                return rt.task_result({"status": "HANDOFF", "reason": f"readback failed: {detail}", "outputs": {}})
+            recent = history[-cfg["no_progress_steps"]:]
+            if len(recent) == cfg["no_progress_steps"] and all(not h.get("page_changed") and "WAIT" not in h.get("action", "") for h in recent):
+                return rt.task_result({"status": "BLOCKED", "reason": "no progress for 3 steps", "outputs": {}})
+            prev = {"describe": desc, "readback": detail, "ok": ok, "url_before": obs["url"], "url_after": after["url"]}
+            obs = after
+            result = await finish_if_accepted(node, b, rt, m, esc_model, step, poll=False)  # D28
+            if result:
+                return rt.task_result(result)
     return {"status": "BLOCKED", "reason": f"step budget ({cfg['max_steps']}) exhausted", "outputs": {}}

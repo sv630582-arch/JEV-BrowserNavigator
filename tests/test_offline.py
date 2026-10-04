@@ -81,7 +81,7 @@ class FakeJev:
         return {"answers": ans, "usage": {"prompt_tokens": len(json.dumps(body)) // 4}}
 
 
-async def run_case(shape, low_conf_at=None):
+async def run_case(shape, low_conf_at=None, trace_directory=None):
     fake = FakeJev(shape, low_conf_at)
     jev.http_post = fake
     escalate.http_post = fake
@@ -89,11 +89,55 @@ async def run_case(shape, low_conf_at=None):
     out = Path(tempfile.mkdtemp()) / "rates.xlsx"
     bus, frames = EventBus(), FrameStore()
     cfg = {**aop["global_config"], "browser": {"headless": True, "user_data_dir": tempfile.mkdtemp()}}
+    if trace_directory is not None:
+        cfg["tracing"] = {"enabled": True, "directory": str(trace_directory)}
     rt = Runtime(cfg, {"openrouter": "test"}, bus, frames)
     fixture = (ROOT / "tests" / "fixtures" / "rates.html").resolve().as_uri()
     res = await run_aop(aop, {"start_url": fixture, "export_path": str(out)}, rt)
     kinds = [e["type"] for e in bus.history]
+    if trace_directory is not None:
+        events = [json.loads(line) for line in bus.trace_writer.path.read_text(encoding="utf-8").splitlines()]
+        assert events[-1]["type"] == "run_finished"
+        assert sum(e["type"] == "run_finished" for e in events) == 1
+        assert [e["sequence"] for e in events] == list(range(1, len(events) + 1))
+        assert all(e["run_id"] == rt.run_id for e in events)
+        decisions = [e for e in events if e["type"] == "decision"]
+        assert len(decisions) == fake.calls
+        assert len([e for e in events if e["type"] == "step_finished"]) == fake.calls
+        assert len({e["step_id"] for e in decisions}) == fake.calls
+        assert len({e["node_execution_id"] for e in decisions}) == 2
     return res, rt.metrics.snapshot(), out, frames.seq, kinds, bus.history
+
+
+async def check_native_dialog_ui():
+    """Exercise the actual SSE consumer in Chromium without a running server."""
+    from playwright.async_api import async_playwright
+    html = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+    aop = (ROOT / "aop" / "wf_mortgage_rates.json").read_text(encoding="utf-8")
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            await page.add_init_script("window.EventSource = class { constructor() { window.testEvents = this; } };")
+            async def route(request):
+                if request.request.url == "http://demo.test/":
+                    await request.fulfill(content_type="text/html", body=html)
+                elif request.request.url == "http://demo.test/aop":
+                    await request.fulfill(content_type="application/json", body=aop)
+                else:
+                    await request.abort()
+            await page.route("**/*", route)
+            await page.goto("http://demo.test/")
+            for kind in ("alert", "confirm", "prompt", "beforeunload"):
+                await page.evaluate("event => window.testEvents.onmessage({data: JSON.stringify(event)})",
+                                    {"type": "native_dialog", "dialog_type": kind, "message": "fixture dialog"})
+                assert kind + ": fixture dialog (dismissed)" in await page.locator("#list").inner_text()
+            assert "native_dialog: fixture dialog" not in await page.locator("#list").inner_text()
+            assert not errors, errors
+        finally:
+            await browser.close()
 
 
 def main():
@@ -113,6 +157,13 @@ def main():
         ok &= res["status"] == "success" and out.exists() and nframes > 0 and len(outs.get("rate_details", [])) >= 6
         if low:
             ok &= bool(esc)
+    # Exercise persistence with the same real-browser fixture; existing cases remain unchanged.
+    with tempfile.TemporaryDirectory() as trace_directory:
+        res, _, out, _, _, _ = asyncio.run(run_case("full", trace_directory=trace_directory))
+        ok &= res["status"] == "success" and out.exists()
+        print("  trace-enabled browser integration: passed")
+    asyncio.run(check_native_dialog_ui())
+    print("  native-dialog UI contract: passed")
     print("\nALL PASSED" if ok else "\nFAILURES")
     sys.exit(0 if ok else 1)
 

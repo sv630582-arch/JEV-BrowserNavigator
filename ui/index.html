@@ -309,7 +309,7 @@ es.onmessage = (msg) => {
     case 'node_finished':
       addRow('■', ev.status, ev.node + ': ' + ev.reason, '', ev.status === 'DONE' ? '' : 'bad'); metrics(ev.metrics); break;
     case 'native_dialog':
-      addRow('!', 'DIALOG', ev.type + ': ' + ev.message + ' (dismissed)', '', 'bad'); break;
+      addRow('!', 'DIALOG', ev.dialog_type + ': ' + ev.message + ' (dismissed)', '', 'bad'); break;
     case 'error':
       addRow('!', 'ERROR', ev.message, '', 'bad'); break;
     case 'run_finished':

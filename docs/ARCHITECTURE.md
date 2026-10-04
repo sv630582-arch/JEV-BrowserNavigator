@@ -154,6 +154,42 @@ Event types: `run_started, node_started, observation, jev_request, decision, act
 acceptance, outputs, node_finished, native_dialog, error, run_finished`. Metrics travel inside
 `decision`, `action`, `escalation`, `node_finished`, `run_finished`.
 
+### Phase 1 execution trace
+
+Tracing is an optional sink on the existing `Runtime.emit` -> `EventBus.emit`
+path. Runtime supplies run/workflow/node context; EventBus assigns the timestamp
+and sequence and passes the event to console, memory/SSE and the JSONL writer.
+`navigator/tracing.py` writes only a sanitized structural projection, never raw
+model payloads, credentials or page/input text. Persistence is disabled by default.
+
+Hierarchy: run -> node execution (a fresh ID for every graph visit) -> decision
+iteration (`step_id`, preserving node-local `step`) -> action attempts. Existing
+events remain; tracing adds `step_started`, `step_context`, `action_selected`,
+`action_attempt_started`, `action_attempt_error`, `action_attempt_finished`, and
+`step_finished`. Steps without actions are recorded too. `verifies_step_id`
+refers to the previous action, and is null when JEV has no previous action to
+verify. No additional browser snapshots or JEV calls are taken.
+
+`total_step_ms` measures the decision iteration through its completion checks or
+early exit, excluding the initial node observation. Existing action `ms` and
+attempt `ms` include settling/readback; they are not pure Playwright latency.
+JEV `latency_ms` keeps its original meaning. Existing metric calculations are
+unchanged. Normal run finalization is emitted once after browser cleanup; errors
+are reported as errors and still propagate. Catchable cancellation/interruption
+is reported as `interrupted`. Startup failures are correlated too. Standalone
+`run_ui_task` calls allocate node correlation without requiring a runner event.
+Native-dialog payloads use `dialog_type` so they cannot replace event `type`.
+
+The file is `out/traces/<run_id>/execution_trace.jsonl`. Each event is appended and
+flushed immediately. A run ending without `run_finished` is incomplete. Writer
+errors and console failures are fail-open. Terminal attempts are tracked
+separately from delivery to the replayable EventBus history; a bounded event-only
+fallback preserves the original result and does not rerun automation. Disk
+projection uses explicit nested allowlists, offered operation/target IDs and
+expected flag names; URL hostnames and all free-form content are withheld.
+There is no summary
+artifact, HTTP retry instrumentation, trace UI, or adaptive recovery in Phase 1.
+
 ## 4. Browser and profile
 
 Playwright **launches** a new browser with `launch_persistent_context(user_data_dir=...)`; it does not attach

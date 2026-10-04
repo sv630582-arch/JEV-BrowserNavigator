@@ -49,6 +49,40 @@ set OPENROUTER_API_KEY=sk-or-...                       # macOS: export OPENROUTE
    The agent's Chromium window opens separately; the demo page shows its live screencast.
    Put the demo page full-screen and the Chromium window behind it.
 
+## Optional execution tracing (Phase 1)
+
+Set `tracing.enabled` to `true` in `config.json` to append events incrementally to
+`out/traces/<run_id>/execution_trace.jsonl`. Tracing is disabled by default. No new
+dependencies, model requests, or browser observations are needed.
+
+The existing Runtime/EventBus events carry run, workflow, node-execution and step
+IDs. Each node visit has a distinct ID, and step numbers still restart per node.
+Additional events record decision-iteration boundaries, selected actions and
+individual attempts. `verifies_step_id` links JEV flags to the previous action.
+The final `run_finished` event includes the existing metrics; Phase 1 adds no
+separate summary file, viewer, or recovery behavior.
+
+Disk traces intentionally omit requests, raw responses, variables, outputs and
+full observations. Free-form goals, labels, input values, readback/error messages
+are masked; URLs retain only their scheme. Nested fields are explicitly
+allowlisted; choice distributions retain only offered operations/target IDs, and
+verification flags retain only expected names. Structural metadata, probabilities,
+booleans and timings remain. API keys/authorization headers are
+never persisted. This projection does not modify existing in-memory UI payloads.
+
+Each line is flushed as it is written. Missing `run_finished` means an incomplete
+trace, not success. A persistence failure reports `trace_error` in the existing
+console/SSE stream and disables further writes without changing automation.
+Catchable cancellations are reported as `interrupted` and still propagate.
+Terminal delivery means acceptance into the replayable EventBus history, not a
+guarantee of disk persistence. Failed delivery gets a bounded event-only retry;
+`finished` is set only after delivery. Console failures also remain isolated.
+The trace is diagnostic, not a crash-proof action ledger or resume mechanism.
+
+Validation: `python -X utf8 -m tests.test_policy`,
+`python -X utf8 -m tests.test_offline`, and `python -X utf8 -m tests.test_tracing`.
+The UTF-8 flag avoids Windows console failures when printing action descriptions.
+
 ## Measured vs estimated
 
 | Shown in the UI | Source |

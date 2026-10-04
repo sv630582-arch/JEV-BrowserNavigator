@@ -90,7 +90,7 @@ class Browser:
 
     async def _native_dialog(self, dialog):
         # Native alert/confirm: never auto-accept. Dismiss and report so policy can decide.
-        self.on_event("native_dialog", {"type": dialog.type, "message": dialog.message})
+        self.on_event("native_dialog", {"dialog_type": dialog.type, "message": dialog.message})
         await dialog.dismiss()
 
     async def _start_screencast(self):
